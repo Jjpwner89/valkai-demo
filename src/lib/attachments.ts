@@ -1,6 +1,7 @@
 import type Anthropic from "@anthropic-ai/sdk";
 
-type ContentBlock = Anthropic.Beta.Messages.BetaContentBlockParam;
+// Plain (non-beta) block types, which both the standard and beta endpoints accept.
+type ContentBlock = Anthropic.Messages.DocumentBlockParam | Anthropic.Messages.ImageBlockParam;
 type ImageType = "image/jpeg" | "image/png" | "image/gif" | "image/webp";
 
 const IMAGE_TYPES: ImageType[] = ["image/jpeg", "image/png", "image/gif", "image/webp"];

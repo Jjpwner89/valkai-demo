@@ -1,119 +1,116 @@
 "use client";
 
+import Anthropic from "@anthropic-ai/sdk";
 import { useState } from "react";
-import { Icon } from "./icons";
+import { useApiKey } from "@/lib/apiKey";
+import { classifyFile, hashFile } from "@/lib/intake";
+import { readDetails, runSkill, type Progress, type ReportDetails, type RunInput, type RunResult } from "@/lib/pbrerRun";
+import { buildReview, type ReviewData } from "@/lib/review";
+import Inputs, { sortIntake, type Intake } from "./pbrer/Inputs";
+import Review from "./pbrer/Review";
+import Running from "./pbrer/Running";
+import ToolBar from "./pbrer/ToolBar";
 
-const SLOTS = [
-  "Drafting brief",
-  "Product and admin facts",
-  "MA status and regulatory",
-  "Sales and exposure",
-  "Reference safety information",
-  "Case data",
-  "Prior PBRER",
-];
+type Stage = "inputs" | "running" | "done";
 
-const STEPS = ["Inputs", "Run", "Review"];
-
-// Phase 1: the inputs screen with real file picking. The match check, the run
-// and review come next.
 export default function PbrerTool({ onBack }: { onBack: () => void }) {
-  const [files, setFiles] = useState<Record<number, File>>({});
-  const ready = SLOTS.every((_, i) => files[i]);
+  const { client, disconnect, trackBusy } = useApiKey();
+  const [items, setItems] = useState<Intake[]>([]);
+  const [stage, setStage] = useState<Stage>("inputs");
+  const [details, setDetails] = useState<ReportDetails | null>(null);
+  const [progress, setProgress] = useState<Progress>({ stage: 0, detail: "" });
+  const [runInputs, setRunInputs] = useState<RunInput[]>([]);
+  const [result, setResult] = useState<RunResult | null>(null);
+  const [review, setReview] = useState<ReviewData | null>(null);
+  const [reviewFailed, setReviewFailed] = useState(false);
+  const [error, setError] = useState("");
+
+  function patch(id: string, change: Partial<Intake>) {
+    setItems((prev) => prev.map((it) => (it.id === id ? { ...it, ...change } : it)));
+  }
+
+  function add(files: File[]) {
+    if (!client) return;
+    const fresh: Intake[] = files.map((file) => ({ id: crypto.randomUUID(), file, hash: null, status: "reading", role: null }));
+    setItems((prev) => [...prev, ...fresh]);
+    for (const item of fresh) {
+      void hashFile(item.file).then((hash) => patch(item.id, { hash }));
+      void trackBusy(() => classifyFile(client, item.file))
+        .then((role) => patch(item.id, { role, status: "ready" }))
+        .catch((err) => {
+          if (err instanceof Anthropic.AuthenticationError) disconnect();
+          patch(item.id, { status: "error" });
+        });
+    }
+  }
+
+  async function loadReview(inputs: RunInput[], done: RunResult) {
+    if (!client) return;
+    setReviewFailed(false);
+    try {
+      setReview(await trackBusy(() => buildReview(client, inputs, done)));
+    } catch (err) {
+      if (err instanceof Anthropic.AuthenticationError) disconnect();
+      setReviewFailed(true);
+    }
+  }
+
+  async function run() {
+    if (!client) return;
+    const { used, missing } = sortIntake(items);
+    const inputs = used.map((u) => ({ file: u.file, role: u.role as RunInput["role"] }));
+    setRunInputs(inputs);
+    setStage("running");
+    setError("");
+    setDetails(null);
+    setReview(null);
+    setProgress({ stage: 0, detail: "Finding the product, report number and interval" });
+
+    await trackBusy(async () => {
+      try {
+        const found = await readDetails(client, inputs).catch(() => null);
+        setDetails(found);
+        setProgress({ stage: 1, detail: "Starting the drafting skill" });
+        const done = await runSkill(client, inputs, missing, setProgress);
+        setResult(done);
+        setProgress({ stage: 6, detail: "Matching each value to its source" });
+        await loadReview(inputs, done);
+        setStage("done");
+      } catch (err) {
+        if (err instanceof Anthropic.AuthenticationError) disconnect();
+        setError(
+          err instanceof Anthropic.APIConnectionError
+            ? "Lost the connection to Claude partway through."
+            : err instanceof Error
+              ? err.message
+              : "The run didn't finish.",
+        );
+        setStage("inputs");
+      }
+    });
+  }
+
+  const step = stage === "inputs" ? 0 : stage === "running" ? 1 : 2;
 
   return (
     <>
-      <header className="tbar">
-        <button className="t-back" onClick={onBack}>
-          <Icon name="left" size={16} />
-          <span>Tools</span>
-        </button>
-        <div className="t-title">PBRER drafting</div>
-        <div className="steps">
-          {STEPS.map((s, i) => (
-            <div key={s} className="steps-item">
-              <div className={`st${i === 0 ? " cur" : ""}`}>
-                <span className="st-dot">{i + 1}</span>
-                {s}
-              </div>
-              {i < STEPS.length - 1 && <span className="st-line" />}
-            </div>
-          ))}
-        </div>
-      </header>
-      <div className="body two">
-        <div className="col-main">
-          <h2 className="b-h gap">Upload this period&apos;s data</h2>
-          <div className="ups">
-            {SLOTS.map((label, i) => {
-              const file = files[i];
-              return (
-                <label key={label} className={`up${file ? "" : " miss"}`}>
-                  <div className="up-lab">
-                    <span className="up-n">{i + 1}</span>
-                    {label}
-                  </div>
-                  <div className={`up-file${file ? "" : " drop"}`}>
-                    <Icon name={file ? "file" : "up"} size={15} />
-                    {file ? (
-                      <>
-                        {file.name}
-                        <em>{formatSize(file.size)}</em>
-                      </>
-                    ) : (
-                      <>
-                        Choose a file or <u>browse</u>
-                      </>
-                    )}
-                  </div>
-                  <div className="up-st">
-                    {file && (
-                      <span className="st-ok">
-                        <Icon name="check" size={13} weight={3} />
-                      </span>
-                    )}
-                  </div>
-                  <input
-                    type="file"
-                    hidden
-                    onChange={(e) => {
-                      const f = e.target.files?.[0];
-                      if (f) setFiles((prev) => ({ ...prev, [i]: f }));
-                    }}
-                  />
-                </label>
-              );
-            })}
-          </div>
-        </div>
-        <div className="col-side">
-          <div className="panel">
-            <div className="p-h">Preloaded</div>
-            <div className="pre">
-              <Icon name="file" size={15} />
-              <div>
-                <b>PBRER section template</b>
-                <span>Sections 1–4, built in</span>
-              </div>
-            </div>
-            <div className="pre">
-              <Icon name="file" size={15} />
-              <div>
-                <b>Drafting skill</b>
-                <span>pbrer-section-draft</span>
-              </div>
-            </div>
-          </div>
-          <button className="run" disabled={!ready}>
-            Run draft
-            <Icon name="up" size={15} weight={2.5} />
-          </button>
-        </div>
-      </div>
+      <ToolBar step={step} onBack={onBack} />
+      {error && <div className="run-error">{error} Your files are still here, so you can run it again.</div>}
+      {stage === "inputs" && (
+        <Inputs items={items} onAdd={add} onRemove={(id) => setItems((prev) => prev.filter((it) => it.id !== id))} onRun={() => void run()} />
+      )}
+      {stage === "running" && <Running details={details} progress={progress} />}
+      {stage === "done" && result && (
+        <Review
+          key={result.draft}
+          result={result}
+          review={review}
+          reviewFailed={reviewFailed}
+          inputs={runInputs}
+          onRetryReview={() => void loadReview(runInputs, result)}
+          onStartOver={() => setStage("inputs")}
+        />
+      )}
     </>
   );
-}
-
-function formatSize(bytes: number) {
-  return bytes < 1024 * 1024 ? `${(bytes / 1024).toFixed(1)} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
